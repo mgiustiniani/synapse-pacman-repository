@@ -94,14 +94,11 @@ for pkgdir in "${SYNAPSE_DIRS[@]}"; do
     SUCCESS+=("$local_name (dry-run)")
     continue
   fi
-
   # Build (set +e: non uscire al primo fallimento, continua con gli altri)
   set +e
   cd "$pkgdir"
-  makepkg -s --noconfirm \
-    > "$BUILD_DIR/${local_name}.build.log" 2>&1
+  makepkg -s --noconfirm > "$BUILD_DIR/${local_name}.build.log" 2>&1
   MAKEPKG_RC=$?
-  cd -
   set -e
 
   if [[ $MAKEPKG_RC -eq 0 ]]; then
@@ -162,9 +159,11 @@ if [[ "$PKG_COUNT" -gt 0 || "$DRY_RUN" == "true" ]]; then
   SYMLINK_COUNT=0
   for link in "$REPO_DIR"/*; do
     if [[ -L "$link" && -f "$link" ]]; then
+      cd $REPO_DIR
       target=$(readlink "$link")
       if [[ -f "$target" ]]; then
-        cp -l "$target" "$link" 2>/dev/null && ((SYMLINK_COUNT++)) || true
+	rm $link
+        cp -l $target $link && ((SYMLINK_COUNT++)) || true
       fi
     fi
   done
