@@ -82,6 +82,7 @@ echo ""
 echo "[3/4] Building packages ..."
 FAILURES=()
 SUCCESS=()
+BUILT_PACKAGES=()
 
 for pkgdir in "${SYNAPSE_DIRS[@]}"; do
   local_name=$(basename "$pkgdir")
@@ -104,6 +105,9 @@ for pkgdir in "${SYNAPSE_DIRS[@]}"; do
   if [[ $MAKEPKG_RC -eq 0 ]]; then
     echo "  └─ ✓ built successfully"
     SUCCESS+=("$local_name")
+    while IFS= read -r -d '' built_pkg; do
+      BUILT_PACKAGES+=("$built_pkg")
+    done < <(find "$pkgdir" -maxdepth 1 -type f -name '*.pkg.tar.zst' -print0)
   else
     echo "  └─ ✗ build failed (exit $MAKEPKG_RC)"
     # Stampa ultime righe del log inline
@@ -127,21 +131,28 @@ echo ""
 echo "[4/4] Installing packages into repo ..."
 mkdir -p "$REPO_DIR"
 
-# Find all built .pkg.tar.zst files and copy them
+# Copy package outputs recorded from successful builds only. Do not recursively
+# collect source archives that happen to use the pacman package suffix.
 PKG_COUNT=0
-while IFS= read -r -d '' pkg; do
-  cp "$pkg" "$REPO_DIR/"
+COPIED_PACKAGES=()
+for pkg in "${BUILT_PACKAGES[@]}"; do
+  destination="$REPO_DIR/$(basename "$pkg")"
+  cp "$pkg" "$destination"
+  COPIED_PACKAGES+=("$destination")
   echo "  ✓ $(basename "$pkg")"
   ((PKG_COUNT++)) || true
-done < <(find "$BUILD_DIR/pkgs" -name "*.pkg.tar.zst" -print0 2>/dev/null)
+done
 
 if [[ "$PKG_COUNT" -gt 0 || "$DRY_RUN" == "true" ]]; then
-  # Update repo database
-  if command -v repo-add &>/dev/null; then
+  # Add only newly built packages. Re-adding every historical package can make
+  # an older lexicographically-last version replace the current database entry.
+  if $DRY_RUN; then
+    echo "  [dry-run] no package outputs or repository changes"
+  elif command -v repo-add &>/dev/null; then
     echo ""
     echo "  Updating repo database ..."
-    repo-add --quiet "$REPO_DIR/synapse-linux.db" "$REPO_DIR"/*.pkg.tar.zst 2>/dev/null \
-      || repo-add --quiet "$REPO_DIR/synapse-linux.db.tar.gz" "$REPO_DIR"/*.pkg.tar.zst 2>/dev/null \
+    repo-add --quiet "$REPO_DIR/synapse-linux.db" "${COPIED_PACKAGES[@]}" 2>/dev/null \
+      || repo-add --quiet "$REPO_DIR/synapse-linux.db.tar.gz" "${COPIED_PACKAGES[@]}" 2>/dev/null \
       || echo "  ⚠ repo-add failed — database may be stale"
     echo "  ✓ database updated"
   else
