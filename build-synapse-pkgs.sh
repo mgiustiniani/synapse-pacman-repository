@@ -1,189 +1,467 @@
 #!/usr/bin/env bash
-# ================================================================
-#  build-synapse-pkgs.sh
-#  Clone CachyOS-PKGBUILDS @ cachyos-ai-integration,
-#  build all packages whose pkgname starts with "synapse",
-#  and install them into repo/x86_64/
-# ================================================================
+# Build Synapse PKGBUILDs and publish their binary packages into repo/x86_64.
 set -euo pipefail
 
-# ── Config ──────────────────────────────────────────────────────
-PKGBUILDS_REPO="https://github.com/mgiustiniani/CachyOS-PKGBUILDS.git"
-PKGBUILDS_BRANCH="cachyos-ai-integration"
-REPO_DIR="$(cd "$(dirname "$0")" && pwd)/repo/x86_64"
-BUILD_DIR="$(mktemp -d /tmp/synapse-build.XXXXXX)"
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+PKGBUILDS_REPO=${SYNAPSE_PKGBUILDS_REPO:-https://github.com/mgiustiniani/CachyOS-PKGBUILDS.git}
+PKGBUILDS_BRANCH=${SYNAPSE_PKGBUILDS_BRANCH:-cachyos-ai-integration}
+REPO_DIR=${SYNAPSE_REPO_DIR:-$SCRIPT_DIR/repo/x86_64}
 
-# Parse args
 DRY_RUN=false
 CLEAN_UP=true
-for arg in "$@"; do
-  case "$arg" in
-    --dry-run) DRY_RUN=true ;;
-    --no-cleanup) CLEAN_UP=false ;;
+SYNC_DEPS=false
+IGNORE_DEPS=false
+LOCAL_PKGBUILDS_DIR=
+PACKAGE_FILTERS=()
+BUILD_DIR=
+EXIT_CODE=0
+
+usage() {
+  cat <<'EOF'
+Usage: build-synapse-pkgs.sh [OPTIONS]
+
+Builds matching synapse* PKGBUILDs without privilege escalation by default.
+External dependencies must already be installed; dependencies selected in the
+same run are bootstrapped locally. Use --syncdeps explicitly if makepkg should
+ask the configured pacman authenticator to install missing dependencies.
+
+Options:
+  -p, --package NAME         Build only NAME (repeatable; directory or pkgname)
+      --pkgbuilds-dir PATH   Use a local PKGBUILDs checkout instead of cloning
+      --syncdeps             Pass --syncdeps to makepkg (may require authentication)
+      --ignore-deps          Pass --nodeps to makepkg (unsafe; packaging/debug only)
+      --dry-run              Discover and display builds without running makepkg
+      --no-cleanup           Preserve the temporary log/clone directory on success
+  -h, --help                 Show this help
+
+Environment:
+  SYNAPSE_PKGBUILDS_REPO     Git repository URL used when cloning
+  SYNAPSE_PKGBUILDS_BRANCH   Git branch used when cloning
+  SYNAPSE_REPO_DIR           Binary repository output directory
+EOF
+}
+
+require_value() {
+  local option=$1
+  local value=${2-}
+  if [[ -z $value ]]; then
+    echo "error: $option requires a value" >&2
+    usage >&2
+    exit 2
+  fi
+}
+
+while (($#)); do
+  case $1 in
+    -p|--package)
+      require_value "$1" "${2-}"
+      PACKAGE_FILTERS+=("$2")
+      shift 2
+      ;;
+    --package=*)
+      require_value --package "${1#*=}"
+      PACKAGE_FILTERS+=("${1#*=}")
+      shift
+      ;;
+    --pkgbuilds-dir)
+      require_value "$1" "${2-}"
+      LOCAL_PKGBUILDS_DIR=$2
+      shift 2
+      ;;
+    --pkgbuilds-dir=*)
+      require_value --pkgbuilds-dir "${1#*=}"
+      LOCAL_PKGBUILDS_DIR=${1#*=}
+      shift
+      ;;
+    --syncdeps)
+      SYNC_DEPS=true
+      shift
+      ;;
+    --ignore-deps)
+      IGNORE_DEPS=true
+      shift
+      ;;
+    --dry-run)
+      DRY_RUN=true
+      shift
+      ;;
+    --no-cleanup)
+      CLEAN_UP=false
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "error: unknown option: $1" >&2
+      usage >&2
+      exit 2
+      ;;
   esac
 done
 
-EXIT_CODE=0
+if $SYNC_DEPS && $IGNORE_DEPS; then
+  echo 'error: --syncdeps and --ignore-deps are mutually exclusive' >&2
+  exit 2
+fi
+
+if [[ -n $LOCAL_PKGBUILDS_DIR ]]; then
+  if [[ ! -d $LOCAL_PKGBUILDS_DIR ]]; then
+    echo "error: PKGBUILDs directory does not exist: $LOCAL_PKGBUILDS_DIR" >&2
+    exit 2
+  fi
+  LOCAL_PKGBUILDS_DIR=$(realpath "$LOCAL_PKGBUILDS_DIR")
+fi
+REPO_DIR=$(realpath -m "$REPO_DIR")
+BUILD_DIR=$(mktemp -d /tmp/synapse-build.XXXXXX)
 
 cleanup() {
-  EXIT_CODE=$?
-  if [[ -d "$BUILD_DIR" ]]; then
-    if [[ $EXIT_CODE -ne 0 ]]; then
-      echo ""
-      echo "❌ Build fallito — directory di debug conservata:"
-      echo "   $BUILD_DIR"
-      echo "   I log sono in: $BUILD_DIR/*.build.log"
-    elif $CLEAN_UP; then
-      rm -rf "$BUILD_DIR"
-      echo "[clean] removed $BUILD_DIR"
-    fi
+  local rc=$?
+  if [[ -z $BUILD_DIR || ! -d $BUILD_DIR ]]; then
+    return
+  fi
+  if ((rc != 0)); then
+    echo
+    echo "Build failed; debug directory preserved:"
+    echo "  $BUILD_DIR"
+    echo "  logs: $BUILD_DIR/*.build.log"
+  elif $CLEAN_UP; then
+    rm -rf "$BUILD_DIR"
+    echo "[clean] removed $BUILD_DIR"
+  else
+    echo "[clean] preserved $BUILD_DIR (--no-cleanup)"
   fi
 }
 trap cleanup EXIT
 
-echo "================================================================"
-echo " synapse-pacman-repository — build script"
-echo "================================================================"
-echo " build dir : $BUILD_DIR"
-echo " repo dir  : $REPO_DIR"
-echo " dry run   : $DRY_RUN"
-echo "================================================================"
-echo ""
+if $SYNC_DEPS; then
+  BUILD_MODE='sync missing dependencies (authentication may be required)'
+elif $IGNORE_DEPS; then
+  BUILD_MODE='ignore dependency checks'
+else
+  BUILD_MODE='rootless; installed dependencies only'
+fi
 
-# ── Step 1: Clone PKGBUILDS ─────────────────────────────────────
-echo "[1/4] Cloning CachyOS-PKGBUILDS @ $PKGBUILDS_BRANCH ..."
-git clone --branch "$PKGBUILDS_BRANCH" --depth 1 --single-branch \
-  "$PKGBUILDS_REPO" "$BUILD_DIR/pkgs" 2>&1
-echo "[1/4] done."
-echo ""
+printf '%s\n' '================================================================'
+printf '%s\n' ' synapse-pacman-repository — build script'
+printf '%s\n' '================================================================'
+printf ' build dir : %s\n' "$BUILD_DIR"
+printf ' repo dir  : %s\n' "$REPO_DIR"
+printf ' mode      : %s\n' "$BUILD_MODE"
+printf ' dry run   : %s\n' "$DRY_RUN"
+printf '%s\n\n' '================================================================'
 
-# ── Step 2: Find synapse* PKGBUILDs ─────────────────────────────
+# Step 1: choose the PKGBUILDs source.
+if [[ -n $LOCAL_PKGBUILDS_DIR ]]; then
+  PKGBUILDS_ROOT=$LOCAL_PKGBUILDS_DIR
+  echo "[1/4] Using local PKGBUILDs: $PKGBUILDS_ROOT"
+else
+  PKGBUILDS_ROOT=$BUILD_DIR/pkgs
+  echo "[1/4] Cloning CachyOS-PKGBUILDS @ $PKGBUILDS_BRANCH ..."
+  git clone --branch "$PKGBUILDS_BRANCH" --depth 1 --single-branch \
+    "$PKGBUILDS_REPO" "$PKGBUILDS_ROOT" 2>&1
+fi
+echo '[1/4] done.'
+echo
+
+matches_filter() {
+  local directory=$1
+  local package=$2
+  local filter
+  ((${#PACKAGE_FILTERS[@]} == 0)) && return 0
+  for filter in "${PACKAGE_FILTERS[@]}"; do
+    if [[ $filter == "$directory" || $filter == "$package" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Step 2: discover deterministic top-level and nested Synapse PKGBUILDs.
 echo "[2/4] Finding PKGBUILDs with pkgname starting with 'synapse' ..."
 SYNAPSE_DIRS=()
+SYNAPSE_NAMES=()
+declare -A FILTER_FOUND=()
 
 while IFS= read -r -d '' pkgbuild; do
   pkgdir=$(dirname "$pkgbuild")
-  pkgname=$(grep -m1 '^pkgname=' "$pkgbuild" | cut -d= -f2 | tr -d "'\" ")
-  if [[ "$pkgname" == synapse* ]]; then
-    SYNAPSE_DIRS+=("$pkgdir")
-    echo "  ✓ $(basename "$pkgdir") → $pkgname"
+  local_name=$(basename "$pkgdir")
+  pkgname=$(sed -n -E "/^[[:space:]]*pkgname=/{s/^[^=]+=//; s/[()'\"[:space:]]//g; p; q;}" "$pkgbuild")
+  if [[ $pkgname != synapse* ]] || ! matches_filter "$local_name" "$pkgname"; then
+    continue
   fi
-done < <(find "$BUILD_DIR/pkgs" -name PKGBUILD -print0)
+  SYNAPSE_DIRS+=("$pkgdir")
+  SYNAPSE_NAMES+=("$pkgname")
+  echo "  ✓ $local_name → $pkgname"
+  for filter in "${PACKAGE_FILTERS[@]}"; do
+    if [[ $filter == "$local_name" || $filter == "$pkgname" ]]; then
+      FILTER_FOUND["$filter"]=1
+    fi
+  done
+done < <(
+  find "$PKGBUILDS_ROOT" \
+    \( -type d \( -name .git -o -name src -o -name pkg \) -prune \) -o \
+    \( -type f -name PKGBUILD -print0 \) | sort -z
+)
 
-if [[ ${#SYNAPSE_DIRS[@]} -eq 0 ]]; then
-  echo "  ✗ No synapse* packages found. Exiting."
+for filter in "${PACKAGE_FILTERS[@]}"; do
+  if [[ -z ${FILTER_FOUND[$filter]+set} ]]; then
+    echo "  ✗ requested package not found: $filter" >&2
+    exit 1
+  fi
+done
+if ((${#SYNAPSE_DIRS[@]} == 0)); then
+  echo '  ✗ No matching synapse* packages found.' >&2
   exit 1
 fi
+printf '[2/4] found %d package(s).\n\n' "${#SYNAPSE_DIRS[@]}"
 
-echo "[2/4] found ${#SYNAPSE_DIRS[@]} package(s)."
-echo ""
+declare -A SELECTED_PACKAGE_NAMES=()
+for pkgname in "${SYNAPSE_NAMES[@]}"; do
+  SELECTED_PACKAGE_NAMES["$pkgname"]=1
+done
 
-# ── Step 3: Build each package ─────────────────────────────────
-echo "[3/4] Building packages ..."
+dependency_name() {
+  local dependency=$1
+  printf '%s' "${dependency%%[<>=]*}"
+}
+
+# Resolve selected-package edges once, then build providers before consumers.
+declare -A DECLARED_DEPENDENCIES=() INTERNAL_DEPENDENCIES=()
+for index in "${!SYNAPSE_DIRS[@]}"; do
+  pkgdir=${SYNAPSE_DIRS[$index]}
+  pkgname=${SYNAPSE_NAMES[$index]}
+  srcinfo=$(cd "$pkgdir" && makepkg --printsrcinfo)
+  dependencies=()
+  mapfile -t dependencies < <(
+    awk -F ' = ' -v arch=$(uname -m) '
+      {
+        key=$1
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", key)
+        if (key == "depends" || key == "depends_" arch) print $2
+      }
+    ' <<<"$srcinfo"
+  )
+  DECLARED_DEPENDENCIES["$pkgname"]="${dependencies[*]}"
+  internal=()
+  for dependency in "${dependencies[@]}"; do
+    name=$(dependency_name "$dependency")
+    if [[ -n ${SELECTED_PACKAGE_NAMES[$name]+set} ]]; then
+      internal+=("$name")
+    fi
+  done
+  INTERNAL_DEPENDENCIES["$pkgname"]="${internal[*]}"
+done
+
+ORDERED_DIRS=()
+ORDERED_NAMES=()
+declare -A ORDERED_PACKAGE_NAMES=()
+while ((${#ORDERED_NAMES[@]} < ${#SYNAPSE_NAMES[@]})); do
+  progress=false
+  for index in "${!SYNAPSE_NAMES[@]}"; do
+    pkgname=${SYNAPSE_NAMES[$index]}
+    [[ -z ${ORDERED_PACKAGE_NAMES[$pkgname]+set} ]] || continue
+    ready=true
+    for dependency in ${INTERNAL_DEPENDENCIES[$pkgname]-}; do
+      if [[ -z ${ORDERED_PACKAGE_NAMES[$dependency]+set} ]]; then
+        ready=false
+        break
+      fi
+    done
+    $ready || continue
+    ORDERED_DIRS+=("${SYNAPSE_DIRS[$index]}")
+    ORDERED_NAMES+=("$pkgname")
+    ORDERED_PACKAGE_NAMES["$pkgname"]=1
+    progress=true
+  done
+  if ! $progress; then
+    echo '  ⚠ selected package dependency cycle; preserving discovery order' >&2
+    for index in "${!SYNAPSE_NAMES[@]}"; do
+      pkgname=${SYNAPSE_NAMES[$index]}
+      [[ -z ${ORDERED_PACKAGE_NAMES[$pkgname]+set} ]] || continue
+      ORDERED_DIRS+=("${SYNAPSE_DIRS[$index]}")
+      ORDERED_NAMES+=("$pkgname")
+      ORDERED_PACKAGE_NAMES["$pkgname"]=1
+    done
+  fi
+done
+SYNAPSE_DIRS=("${ORDERED_DIRS[@]}")
+SYNAPSE_NAMES=("${ORDERED_NAMES[@]}")
+
+only_selected_dependencies_missing() {
+  local pkgname=$1
+  local dependency name
+  local -a dependencies=() missing=()
+  read -r -a dependencies <<<"${DECLARED_DEPENDENCIES[$pkgname]-}"
+  ((${#dependencies[@]} > 0)) || return 1
+  mapfile -t missing < <(pacman -T "${dependencies[@]}" 2>/dev/null || true)
+  ((${#missing[@]} > 0)) || return 1
+  for dependency in "${missing[@]}"; do
+    name=$(dependency_name "$dependency")
+    [[ -n ${SELECTED_PACKAGE_NAMES[$name]+set} ]] || return 1
+  done
+  return 0
+}
+
+# Step 3: build without --syncdeps unless the caller explicitly opted in.
+echo '[3/4] Building packages ...'
 FAILURES=()
 SUCCESS=()
 BUILT_PACKAGES=()
+declare -A BUILT_SEEN=() FAILED_PACKAGE_NAMES=()
+MAKEPKG_ARGS=(--noconfirm --force)
+$SYNC_DEPS && MAKEPKG_ARGS+=(--syncdeps)
+$IGNORE_DEPS && MAKEPKG_ARGS+=(--nodeps)
 
-for pkgdir in "${SYNAPSE_DIRS[@]}"; do
+for index in "${!SYNAPSE_DIRS[@]}"; do
+  pkgdir=${SYNAPSE_DIRS[$index]}
+  pkgname=${SYNAPSE_NAMES[$index]}
   local_name=$(basename "$pkgdir")
-  echo ""
+  log=$BUILD_DIR/${local_name}.build.log
+  blocked_by=()
+  for dependency in ${INTERNAL_DEPENDENCIES[$pkgname]-}; do
+    if [[ -n ${FAILED_PACKAGE_NAMES[$dependency]+set} ]]; then
+      blocked_by+=("$dependency")
+    fi
+  done
+  echo
   echo "  ┌─ Building: $local_name"
+  echo "  ├─ pkgname: $pkgname"
   echo "  ├─ dir: $pkgdir"
+  if ((${#blocked_by[@]} > 0)); then
+    echo "  └─ ✗ skipped; selected dependency failed: ${blocked_by[*]}"
+    FAILURES+=("$local_name")
+    FAILED_PACKAGE_NAMES["$pkgname"]=1
+    continue
+  fi
+  package_makepkg_args=("${MAKEPKG_ARGS[@]}")
+  bootstrap_selected_dependency=false
+  if ! $SYNC_DEPS && ! $IGNORE_DEPS && only_selected_dependencies_missing "$pkgname"; then
+    package_makepkg_args+=(--nodeps)
+    bootstrap_selected_dependency=true
+  fi
+  if $bootstrap_selected_dependency; then
+    echo '  ├─ dependency mode: bootstrap selected local package(s)'
+  fi
 
   if $DRY_RUN; then
-    echo "  └─ [dry-run] would run: makepkg -s --noconfirm"
+    printf '  └─ [dry-run] would run: makepkg'
+    printf ' %q' "${package_makepkg_args[@]}"
+    printf '\n'
     SUCCESS+=("$local_name (dry-run)")
     continue
   fi
-  # Build (set +e: non uscire al primo fallimento, continua con gli altri)
+
   set +e
-  cd "$pkgdir"
-  makepkg -s --noconfirm > "$BUILD_DIR/${local_name}.build.log" 2>&1
-  MAKEPKG_RC=$?
+  (cd "$pkgdir" && makepkg "${package_makepkg_args[@]}") >"$log" 2>&1
+  makepkg_rc=$?
   set -e
 
-  if [[ $MAKEPKG_RC -eq 0 ]]; then
-    echo "  └─ ✓ built successfully"
-    SUCCESS+=("$local_name")
-    while IFS= read -r -d '' built_pkg; do
-      BUILT_PACKAGES+=("$built_pkg")
-    done < <(find "$pkgdir" -maxdepth 1 -type f -name '*.pkg.tar.zst' -print0)
+  if ((makepkg_rc == 0)); then
+    expected=()
+    mapfile -t expected < <(cd "$pkgdir" && makepkg --packagelist)
+    found_output=false
+    for built_pkg in "${expected[@]}"; do
+      if [[ -f $built_pkg && -z ${BUILT_SEEN[$built_pkg]+set} ]]; then
+        BUILT_PACKAGES+=("$built_pkg")
+        BUILT_SEEN["$built_pkg"]=1
+        found_output=true
+      fi
+    done
+    if $found_output; then
+      echo '  └─ ✓ built successfully'
+      SUCCESS+=("$local_name")
+    else
+      echo '  └─ ✗ makepkg returned success but produced no package'
+      FAILURES+=("$local_name")
+      FAILED_PACKAGE_NAMES["$pkgname"]=1
+    fi
   else
-    echo "  └─ ✗ build failed (exit $MAKEPKG_RC)"
-    # Stampa ultime righe del log inline
-    echo "     ── ultime 20 righe del log ──"
-    tail -20 "$BUILD_DIR/${local_name}.build.log" 2>/dev/null | sed 's/^/     | /'
-    echo "     ──────────────────────────────"
-    echo "     Log completo: $BUILD_DIR/${local_name}.build.log"
+    echo "  └─ ✗ build failed (exit $makepkg_rc)"
+    echo '     ── last 20 log lines ──'
+    tail -20 "$log" 2>/dev/null | sed 's/^/     | /'
+    echo '     ───────────────────────'
+    echo "     full log: $log"
     FAILURES+=("$local_name")
+    FAILED_PACKAGE_NAMES["$pkgname"]=1
   fi
 done
 
-echo ""
-echo "[3/4] Build summary: ${#SUCCESS[@]} ok, ${#FAILURES[@]} failed"
-if [[ ${#FAILURES[@]} -gt 0 ]]; then
+echo
+printf '[3/4] Build summary: %d ok, %d failed\n' "${#SUCCESS[@]}" "${#FAILURES[@]}"
+if ((${#FAILURES[@]} > 0)); then
   echo "  Failed: ${FAILURES[*]}"
   EXIT_CODE=1
 fi
-echo ""
+echo
 
-# ── Step 4: Install into repo ──────────────────────────────────
-echo "[4/4] Installing packages into repo ..."
-mkdir -p "$REPO_DIR"
-
-# Copy package outputs recorded from successful builds only. Do not recursively
-# collect source archives that happen to use the pacman package suffix.
-PKG_COUNT=0
+# Step 4: copy only outputs reported by successful makepkg invocations.
+echo '[4/4] Installing packages into repo ...'
 COPIED_PACKAGES=()
-for pkg in "${BUILT_PACKAGES[@]}"; do
-  destination="$REPO_DIR/$(basename "$pkg")"
-  cp "$pkg" "$destination"
-  COPIED_PACKAGES+=("$destination")
-  echo "  ✓ $(basename "$pkg")"
-  ((PKG_COUNT++)) || true
-done
-
-if [[ "$PKG_COUNT" -gt 0 || "$DRY_RUN" == "true" ]]; then
-  # Add only newly built packages. Re-adding every historical package can make
-  # an older lexicographically-last version replace the current database entry.
-  if $DRY_RUN; then
-    echo "  [dry-run] no package outputs or repository changes"
-  elif command -v repo-add &>/dev/null; then
-    echo ""
-    echo "  Updating repo database ..."
-    repo-add --quiet "$REPO_DIR/synapse-linux.db" "${COPIED_PACKAGES[@]}" 2>/dev/null \
-      || repo-add --quiet "$REPO_DIR/synapse-linux.db.tar.gz" "${COPIED_PACKAGES[@]}" 2>/dev/null \
-      || echo "  ⚠ repo-add failed — database may be stale"
-    echo "  ✓ database updated"
-  else
-    echo "  ⚠ repo-add not found — skipping database update"
-    echo "    install it: pacman -S pacman-contrib"
-  fi
-
-  # Cleanup: remove .old files left by repo-add
-  echo ""
-  echo "  Cleaning up repo artifacts ..."
-  rm -f "$REPO_DIR"/*.old
-  echo "  ✓ removed .old files"
-
-  # Convert symlinks to hardlinks (git hates symlinks to binary blobs)
-  SYMLINK_COUNT=0
-  for link in "$REPO_DIR"/*; do
-    if [[ -L "$link" && -f "$link" ]]; then
-      cd $REPO_DIR
-      target=$(readlink "$link")
-      if [[ -f "$target" ]]; then
-	rm $link
-        cp -l $target $link && ((SYMLINK_COUNT++)) || true
-      fi
-    fi
+if $DRY_RUN; then
+  echo '  [dry-run] no package outputs or repository changes'
+else
+  mkdir -p "$REPO_DIR"
+  for pkg in "${BUILT_PACKAGES[@]}"; do
+    destination=$REPO_DIR/$(basename "$pkg")
+    cp -f -- "$pkg" "$destination"
+    COPIED_PACKAGES+=("$destination")
+    echo "  ✓ $(basename "$pkg")"
   done
-  if [[ $SYMLINK_COUNT -gt 0 ]]; then
-    echo "  ✓ converted $SYMLINK_COUNT symlink(s) to hardlink(s)"
+
+  if ((${#COPIED_PACKAGES[@]} > 0)); then
+    if command -v repo-add >/dev/null 2>&1; then
+      echo
+      echo '  Updating repo database ...'
+      if repo-add --quiet "$REPO_DIR/synapse-linux.db" "${COPIED_PACKAGES[@]}" \
+          || repo-add --quiet "$REPO_DIR/synapse-linux.db.tar.gz" "${COPIED_PACKAGES[@]}"; then
+        echo '  ✓ database updated'
+      else
+        echo '  ✗ repo-add failed; database may be stale' >&2
+        EXIT_CODE=1
+      fi
+    else
+      echo '  ✗ repo-add not found; install pacman-contrib' >&2
+      EXIT_CODE=1
+    fi
+
+    echo
+    echo '  Cleaning up repo artifacts ...'
+    rm -f -- "$REPO_DIR"/*.old
+    echo '  ✓ removed .old files'
+
+    shopt -s nullglob
+    symlink_count=0
+    for link in "$REPO_DIR"/*; do
+      [[ -L $link && -f $link ]] || continue
+      target=$(readlink -- "$link")
+      if [[ $target = /* ]]; then
+        target_path=$target
+      else
+        target_path=$REPO_DIR/$target
+      fi
+      if [[ -f $target_path ]]; then
+        rm -- "$link"
+        cp -l -- "$target_path" "$link"
+        ((symlink_count++)) || true
+      fi
+    done
+    shopt -u nullglob
+    if ((symlink_count > 0)); then
+      echo "  ✓ converted $symlink_count symlink(s) to hardlink(s)"
+    fi
+  else
+    echo '  No successful package outputs to publish.'
   fi
 fi
 
-echo ""
-echo "================================================================"
-echo " Done!"
-echo "================================================================"
+echo
+printf '%s\n' '================================================================'
+if ((EXIT_CODE == 0)); then
+  echo ' Done!'
+else
+  echo ' Completed with failures.'
+fi
+printf '%s\n' '================================================================'
+exit "$EXIT_CODE"
