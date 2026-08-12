@@ -11,10 +11,13 @@ DRY_RUN=false
 CLEAN_UP=true
 SYNC_DEPS=false
 IGNORE_DEPS=false
+STRICT=false
 LOCAL_PKGBUILDS_DIR=
 PACKAGE_FILTERS=()
 BUILD_DIR=
 EXIT_CODE=0
+HAD_PACKAGE_FAILURES=false
+MAX_PACKAGE_BYTES=${SYNAPSE_MAX_PACKAGE_BYTES:-104857600}
 
 usage() {
   cat <<'EOF'
@@ -31,13 +34,19 @@ Options:
       --syncdeps             Pass --syncdeps to makepkg (may require authentication)
       --ignore-deps          Pass --nodeps to makepkg (unsafe; packaging/debug only)
       --dry-run              Discover and display builds without running makepkg
+      --strict               Exit non-zero if any package fails
       --no-cleanup           Preserve the temporary log/clone directory on success
   -h, --help                 Show this help
+
+By default, independent successful packages are published and the command exits
+successfully even if another package fails. If no package can be published, the
+command still fails. Use --strict when every selected package is mandatory.
 
 Environment:
   SYNAPSE_PKGBUILDS_REPO     Git repository URL used when cloning
   SYNAPSE_PKGBUILDS_BRANCH   Git branch used when cloning
   SYNAPSE_REPO_DIR           Binary repository output directory
+  SYNAPSE_MAX_PACKAGE_BYTES  Publication limit (default: 104857600; 0 disables)
 EOF
 }
 
@@ -85,6 +94,10 @@ while (($#)); do
       DRY_RUN=true
       shift
       ;;
+    --strict)
+      STRICT=true
+      shift
+      ;;
     --no-cleanup)
       CLEAN_UP=false
       shift
@@ -105,6 +118,10 @@ if $SYNC_DEPS && $IGNORE_DEPS; then
   echo 'error: --syncdeps and --ignore-deps are mutually exclusive' >&2
   exit 2
 fi
+if [[ ! $MAX_PACKAGE_BYTES =~ ^[0-9]+$ ]]; then
+  echo 'error: SYNAPSE_MAX_PACKAGE_BYTES must be a non-negative integer' >&2
+  exit 2
+fi
 
 if [[ -n $LOCAL_PKGBUILDS_DIR ]]; then
   if [[ ! -d $LOCAL_PKGBUILDS_DIR ]]; then
@@ -121,9 +138,9 @@ cleanup() {
   if [[ -z $BUILD_DIR || ! -d $BUILD_DIR ]]; then
     return
   fi
-  if ((rc != 0)); then
+  if ((rc != 0)) || $HAD_PACKAGE_FAILURES; then
     echo
-    echo "Build failed; debug directory preserved:"
+    echo "Package failure logs preserved:"
     echo "  $BUILD_DIR"
     echo "  logs: $BUILD_DIR/*.build.log"
   elif $CLEAN_UP; then
@@ -227,12 +244,28 @@ dependency_name() {
   printf '%s' "${dependency%%[<>=]*}"
 }
 
-# Resolve selected-package edges once, then build providers before consumers.
+# Resolve selected-package edges without allowing one malformed PKGBUILD to
+# abort discovery for every other package.
+FAILURES=()
 declare -A DECLARED_DEPENDENCIES=() INTERNAL_DEPENDENCIES=()
+declare -A FAILED_PACKAGE_NAMES=()
+VALID_DIRS=()
+VALID_NAMES=()
 for index in "${!SYNAPSE_DIRS[@]}"; do
   pkgdir=${SYNAPSE_DIRS[$index]}
   pkgname=${SYNAPSE_NAMES[$index]}
-  srcinfo=$(cd "$pkgdir" && makepkg --printsrcinfo)
+  local_name=$(basename "$pkgdir")
+  metadata_log=$BUILD_DIR/${local_name}.metadata.log
+  if ! srcinfo=$(cd "$pkgdir" && makepkg --printsrcinfo 2>"$metadata_log"); then
+    echo "  ✗ $local_name: invalid PKGBUILD metadata"
+    tail -10 "$metadata_log" 2>/dev/null | sed 's/^/    | /'
+    FAILURES+=("$local_name (metadata)")
+    FAILED_PACKAGE_NAMES["$pkgname"]=1
+    continue
+  fi
+
+  VALID_DIRS+=("$pkgdir")
+  VALID_NAMES+=("$pkgname")
   dependencies=()
   mapfile -t dependencies < <(
     awk -F ' = ' -v arch=$(uname -m) '
@@ -253,6 +286,8 @@ for index in "${!SYNAPSE_DIRS[@]}"; do
   done
   INTERNAL_DEPENDENCIES["$pkgname"]="${internal[*]}"
 done
+SYNAPSE_DIRS=("${VALID_DIRS[@]}")
+SYNAPSE_NAMES=("${VALID_NAMES[@]}")
 
 ORDERED_DIRS=()
 ORDERED_NAMES=()
@@ -264,7 +299,8 @@ while ((${#ORDERED_NAMES[@]} < ${#SYNAPSE_NAMES[@]})); do
     [[ -z ${ORDERED_PACKAGE_NAMES[$pkgname]+set} ]] || continue
     ready=true
     for dependency in ${INTERNAL_DEPENDENCIES[$pkgname]-}; do
-      if [[ -z ${ORDERED_PACKAGE_NAMES[$dependency]+set} ]]; then
+      if [[ -z ${ORDERED_PACKAGE_NAMES[$dependency]+set} \
+          && -z ${FAILED_PACKAGE_NAMES[$dependency]+set} ]]; then
         ready=false
         break
       fi
@@ -306,10 +342,9 @@ only_selected_dependencies_missing() {
 
 # Step 3: build without --syncdeps unless the caller explicitly opted in.
 echo '[3/4] Building packages ...'
-FAILURES=()
 SUCCESS=()
 BUILT_PACKAGES=()
-declare -A BUILT_SEEN=() FAILED_PACKAGE_NAMES=()
+declare -A BUILT_SEEN=()
 MAKEPKG_ARGS=(--noconfirm --force)
 $SYNC_DEPS && MAKEPKG_ARGS+=(--syncdeps)
 $IGNORE_DEPS && MAKEPKG_ARGS+=(--nodeps)
@@ -360,7 +395,13 @@ for index in "${!SYNAPSE_DIRS[@]}"; do
 
   if ((makepkg_rc == 0)); then
     expected=()
-    mapfile -t expected < <(cd "$pkgdir" && makepkg --packagelist)
+    if ! packagelist=$(cd "$pkgdir" && makepkg --packagelist 2>>"$log"); then
+      echo '  └─ ✗ unable to determine package output paths'
+      FAILURES+=("$local_name")
+      FAILED_PACKAGE_NAMES["$pkgname"]=1
+      continue
+    fi
+    mapfile -t expected <<<"$packagelist"
     found_output=false
     for built_pkg in "${expected[@]}"; do
       if [[ -f $built_pkg && -z ${BUILT_SEEN[$built_pkg]+set} ]]; then
@@ -392,76 +433,132 @@ echo
 printf '[3/4] Build summary: %d ok, %d failed\n' "${#SUCCESS[@]}" "${#FAILURES[@]}"
 if ((${#FAILURES[@]} > 0)); then
   echo "  Failed: ${FAILURES[*]}"
-  EXIT_CODE=1
+  HAD_PACKAGE_FAILURES=true
 fi
 echo
 
-# Step 4: copy only outputs reported by successful makepkg invocations.
+# Step 4: publish each successful output independently. Package filenames are
+# immutable: changing bytes requires a pkgver/pkgrel bump. GitHub rejects normal
+# Git blobs larger than 100 MiB, so oversized artifacts are never added to the
+# Pacman database unless an operator explicitly changes the configured limit.
 echo '[4/4] Installing packages into repo ...'
-COPIED_PACKAGES=()
+PUBLISHED_PACKAGES=()
+PUBLISH_FAILURES=()
 if $DRY_RUN; then
   echo '  [dry-run] no package outputs or repository changes'
+elif ((${#BUILT_PACKAGES[@]} == 0)); then
+  echo '  No successful package outputs to publish.'
 else
   mkdir -p "$REPO_DIR"
-  for pkg in "${BUILT_PACKAGES[@]}"; do
-    destination=$REPO_DIR/$(basename "$pkg")
-    cp -f -- "$pkg" "$destination"
-    COPIED_PACKAGES+=("$destination")
-    echo "  ✓ $(basename "$pkg")"
-  done
+  if ! command -v repo-add >/dev/null 2>&1; then
+    echo '  ✗ repo-add not found; install pacman-contrib' >&2
+    EXIT_CODE=1
+  else
+    for pkg in "${BUILT_PACKAGES[@]}"; do
+      filename=$(basename "$pkg")
+      destination=$REPO_DIR/$filename
+      package_size=$(stat -c %s -- "$pkg")
 
-  if ((${#COPIED_PACKAGES[@]} > 0)); then
-    if command -v repo-add >/dev/null 2>&1; then
-      echo
-      echo '  Updating repo database ...'
-      if repo-add --quiet "$REPO_DIR/synapse-linux.db" "${COPIED_PACKAGES[@]}" \
-          || repo-add --quiet "$REPO_DIR/synapse-linux.db.tar.gz" "${COPIED_PACKAGES[@]}"; then
-        echo '  ✓ database updated'
-      else
-        echo '  ✗ repo-add failed; database may be stale' >&2
-        EXIT_CODE=1
+      if ((MAX_PACKAGE_BYTES > 0 && package_size > MAX_PACKAGE_BYTES)); then
+        echo "  ✗ $filename"
+        echo "    package is $package_size bytes; limit is $MAX_PACKAGE_BYTES"
+        echo '    not published: this artifact requires Git LFS or external storage'
+        PUBLISH_FAILURES+=("$filename (oversized)")
+        HAD_PACKAGE_FAILURES=true
+        continue
       fi
-    else
-      echo '  ✗ repo-add not found; install pacman-contrib' >&2
-      EXIT_CODE=1
-    fi
 
-    echo
-    echo '  Cleaning up repo artifacts ...'
-    rm -f -- "$REPO_DIR"/*.old
-    echo '  ✓ removed .old files'
-
-    shopt -s nullglob
-    symlink_count=0
-    for link in "$REPO_DIR"/*; do
-      [[ -L $link && -f $link ]] || continue
-      target=$(readlink -- "$link")
-      if [[ $target = /* ]]; then
-        target_path=$target
+      copied=false
+      if [[ -e $destination ]]; then
+        if ! cmp -s -- "$pkg" "$destination"; then
+          echo "  ✗ $filename"
+          echo '    immutable package filename already exists with different content'
+          echo '    bump pkgrel or pkgver before rebuilding'
+          PUBLISH_FAILURES+=("$filename (version not bumped)")
+          HAD_PACKAGE_FAILURES=true
+          continue
+        fi
+        echo "  ✓ $filename (already present, unchanged)"
       else
-        target_path=$REPO_DIR/$target
+        temporary=$REPO_DIR/.${filename}.tmp.$$
+        if ! cp -- "$pkg" "$temporary" || ! mv -- "$temporary" "$destination"; then
+          rm -f -- "$temporary"
+          echo "  ✗ unable to copy $filename" >&2
+          PUBLISH_FAILURES+=("$filename (copy failed)")
+          HAD_PACKAGE_FAILURES=true
+          continue
+        fi
+        copied=true
+        echo "  ✓ $filename"
       fi
-      if [[ -f $target_path ]]; then
-        rm -- "$link"
-        cp -l -- "$target_path" "$link"
-        ((symlink_count++)) || true
+
+      # Update one package at a time so a bad artifact cannot block independent
+      # packages from reaching the repository database.
+      if repo-add --quiet "$REPO_DIR/synapse-linux.db.tar.gz" "$destination"; then
+        PUBLISHED_PACKAGES+=("$filename")
+      else
+        echo "  ✗ repo-add failed for $filename" >&2
+        PUBLISH_FAILURES+=("$filename (repo-add failed)")
+        HAD_PACKAGE_FAILURES=true
+        if $copied; then
+          rm -f -- "$destination"
+        fi
       fi
     done
-    shopt -u nullglob
-    if ((symlink_count > 0)); then
-      echo "  ✓ converted $symlink_count symlink(s) to hardlink(s)"
+
+    if ((${#PUBLISHED_PACKAGES[@]} > 0)); then
+      echo
+      printf '  ✓ database updated for %d package(s)\n' "${#PUBLISHED_PACKAGES[@]}"
+      echo '  Cleaning up repo artifacts ...'
+      rm -f -- "$REPO_DIR"/*.old
+      echo '  ✓ removed .old files'
+
+      shopt -s nullglob
+      symlink_count=0
+      for link in "$REPO_DIR"/*; do
+        [[ -L $link && -f $link ]] || continue
+        target=$(readlink -- "$link")
+        if [[ $target = /* ]]; then
+          target_path=$target
+        else
+          target_path=$REPO_DIR/$target
+        fi
+        if [[ -f $target_path ]]; then
+          rm -- "$link"
+          cp -l -- "$target_path" "$link"
+          ((symlink_count++)) || true
+        fi
+      done
+      shopt -u nullglob
+      if ((symlink_count > 0)); then
+        echo "  ✓ converted $symlink_count symlink(s) to hardlink(s)"
+      fi
+    else
+      echo '  No package outputs were publishable.'
     fi
-  else
-    echo '  No successful package outputs to publish.'
+  fi
+fi
+
+PACKAGE_FAILURE_COUNT=$((${#FAILURES[@]} + ${#PUBLISH_FAILURES[@]}))
+if ((PACKAGE_FAILURE_COUNT > 0)); then
+  HAD_PACKAGE_FAILURES=true
+  if $STRICT || { ! $DRY_RUN && ((${#PUBLISHED_PACKAGES[@]} == 0)); }; then
+    EXIT_CODE=1
+  elif ! $DRY_RUN; then
+    echo
+    echo '  Partial success: independent successful packages were published.'
+    echo '  Re-run with --strict to make any package failure fatal.'
   fi
 fi
 
 echo
 printf '%s\n' '================================================================'
-if ((EXIT_CODE == 0)); then
-  echo ' Done!'
-else
+if ((EXIT_CODE != 0)); then
   echo ' Completed with failures.'
+elif ((PACKAGE_FAILURE_COUNT > 0)); then
+  echo ' Completed with package failures (partial success).'
+else
+  echo ' Done!'
 fi
 printf '%s\n' '================================================================'
 exit "$EXIT_CODE"
